@@ -507,28 +507,35 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 # ==================== ГЛАВНАЯ ФУНКЦИЯ ====================
-def main():
-    # Инициализируем базу данных
+# ==================== ГЛАВНАЯ ФУНКЦИЯ ====================
+async def main_async():
     init_db()
-
-    # Создаём приложение
     application = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    # Добавляем обработчики
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("stats", stats_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("mood", mood_command))
     application.add_handler(CallbackQueryHandler(button_handler))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-    # Обработка ошибок
     application.add_error_handler(error_handler)
 
-    # Запускаем бота
     print("🌙 Бот 'Я с тобой, я рядом' запущен!")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    await application.initialize()
+    await application.start()
+    await application.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+
+    # Держим бота запущенным
+    while True:
+        await asyncio.sleep(3600)
 
 if __name__ == "__main__":
     import asyncio
-    asyncio.run(main())
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(main_async())
+    except KeyboardInterrupt:
+        pass
+    finally:
+        loop.close()
