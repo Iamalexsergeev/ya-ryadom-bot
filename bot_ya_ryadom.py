@@ -14,15 +14,14 @@ from telegram.ext import (
     filters
 )
 
-# ==================== ЗАГРУЗКА ПЕРЕМЕННЫХ ИЗ .env ====================
-from dotenv import load_dotenv
-load_dotenv()
-
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
+# ==================== НАСТРОЙКИ ====================
+# ЗАМЕНИТЕ ЭТИ ЗНАЧЕНИЯ НА СВОИ:
+# Загружаем из переменных окружения (Render)
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
 
 if not TELEGRAM_TOKEN or not DEEPSEEK_API_KEY:
-    raise ValueError("❌ Не найдены TELEGRAM_TOKEN или DEEPSEEK_API_KEY в .env файле!")
+    raise ValueError("❌ Не найдены TELEGRAM_TOKEN или DEEPSEEK_API_KEY в переменных окружения!")
 
 # DeepSeek API
 DEEPSEEK_URL = "https://api.deepseek.com/chat/completions"
@@ -114,6 +113,7 @@ def init_db():
         )
     """)
 
+    
     # Аналитика
     c.execute('''
         CREATE TABLE IF NOT EXISTS analytics (
@@ -124,7 +124,7 @@ def init_db():
             timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
-
+    
     conn.commit()
     conn.close()
 
@@ -182,7 +182,8 @@ def get_recent_messages(user_id, limit=10):
     )
     messages = c.fetchall()
     conn.close()
-    return list(reversed(messages))  # хронологический порядок
+    # Переворачиваем, чтобы был хронологический порядок
+    return list(reversed(messages))
 
 def save_mood(user_id, mood, note=""):
     conn = sqlite3.connect(DB_NAME)
@@ -192,11 +193,23 @@ def save_mood(user_id, mood, note=""):
         (user_id, mood, note)
     )
     c.execute("UPDATE users SET last_mood = ? WHERE user_id = ?", (mood, user_id))
-    # Убрал дублирующий CREATE TABLE
+    
+    # Аналитика
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS analytics (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            event_type TEXT,
+            event_data TEXT,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
     conn.commit()
     conn.close()
 
 def log_event(user_id, event_type, event_data=""):
+    """Логирует событие для аналитики"""
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
     c.execute(
@@ -207,14 +220,23 @@ def log_event(user_id, event_type, event_data=""):
     conn.close()
 
 def get_stats():
+    """Возвращает ключевые метрики"""
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
+
+    # Всего пользователей
     c.execute("SELECT COUNT(DISTINCT user_id) FROM users")
     total_users = c.fetchone()[0] or 0
+
+    # Активные сегодня
     c.execute("SELECT COUNT(DISTINCT user_id) FROM messages WHERE date(timestamp) = date('now')")
     active_today = c.fetchone()[0] or 0
+
+    # Среднее количество сообщений на пользователя
     c.execute("SELECT AVG(message_count) FROM users")
     avg_messages = c.fetchone()[0] or 0
+
+    # Популярные кнопки
     c.execute("""
         SELECT event_type, COUNT(*) as count 
         FROM analytics 
@@ -223,7 +245,9 @@ def get_stats():
         ORDER BY count DESC
     """)
     popular_buttons = c.fetchall()
+
     conn.close()
+
     return {
         "total_users": total_users,
         "active_today": active_today,
@@ -232,28 +256,29 @@ def get_stats():
     }
 
 # ==================== DEEPSEEK API ====================
-def get_ai_response(user_id, user_message, extra_system=None):
-    """Получает ответ от DeepSeek API с возможностью добавить системные инструкции."""
-    user = get_user(user_id)
-    user_name = ""
-    if user and len(user) > 6:
-        user_name = user[6] if user[6] else ""
+def get_ai_response(user_id, user_message):
+    """Получает ответ от DeepSeek API"""
 
+    # Получаем имя пользователя
+    user = get_user(user_id)
+    user_name = user[6] if user and user[6] else ""
+
+    # Формируем сообщения для API
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
-    if extra_system:
-        messages.append({"role": "system", "content": extra_system})
-
+    # Добавляем контекст (имя пользователя)
     if user_name:
         messages.append({
             "role": "system",
             "content": f"Пользователя зовут {user_name}. Обращайся к ней по имени иногда, но не навязчиво."
         })
 
+    # Добавляем историю
     history = get_recent_messages(user_id, limit=10)
     for role, content in history:
         messages.append({"role": role, "content": content})
 
+    # Добавляем текущее сообщение
     messages.append({"role": "user", "content": user_message})
 
     try:
@@ -272,29 +297,27 @@ def get_ai_response(user_id, user_message, extra_system=None):
             timeout=30
         )
         response.raise_for_status()
+
         result = response.json()
         ai_message = result["choices"][0]["message"]["content"]
+
         return ai_message
+
     except Exception as e:
         logger.error(f"DeepSeek API error: {e}")
-        # Запасной ответ при ошибке
         return "Мне сейчас немного тяжело дышать (технические штуки). Напиши ещё раз через минуту? 🌙"
-
-# ==================== ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ ДЛЯ КНОПОК ====================
-async def generate_button_response(user_id, user_prompt, extra_system):
-    """Генерирует ответ через LLM и сохраняет в историю."""
-    response = get_ai_response(user_id, user_prompt, extra_system)
-    save_message(user_id, "user", user_prompt)
-    save_message(user_id, "assistant", response)
-    return response
 
 # ==================== ОБРАБОТЧИКИ КОМАНД ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка команды /start"""
     user = update.effective_user
     user_id = user.id
+
+    # Сохраняем пользователя
     add_user(user_id, user.username, user.first_name)
     log_event(user_id, "start", f"username:{user.username}")
 
+    # Приветственное сообщение
     welcome_text = """Привет. Я — тот, кто рядом.
 
 Не психолог. Не эксперт. Просто тот, кто напишет доброе утро, выслушает, когда тяжело, и напомнит, что ты уже справляешься лучше, чем думаешь.
@@ -308,10 +331,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("💛 Поддержать проект", callback_data="donate")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
+
     await update.message.reply_text(welcome_text, reply_markup=reply_markup)
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает статистику (для анализа)"""
     stats = get_stats()
+
     stats_text = f"""📊 Статистика бота:
 
 👥 Всего пользователей: {stats['total_users']}
@@ -319,11 +345,14 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 💬 Среднее сообщений на пользователя: {stats['avg_messages']}
 
 🔘 Популярные кнопки:"""
+
     for button, count in stats['popular_buttons']:
         stats_text += f"\n  {button}: {count}"
+
     await update.message.reply_text(stats_text)
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка команды /help"""
     help_text = """Вот что я умею:
 
 💬 Просто напиши — и я рядом
@@ -333,9 +362,11 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 💛 Поддержать проект — если хочешь помочь
 
 Я не психолог. Если тебе плохо по-настоящему — позвони 8-800-2000-122 (Телефон доверия)."""
+
     await update.message.reply_text(help_text)
 
 async def mood_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка команды /mood"""
     keyboard = [
         [InlineKeyboardButton("1 😔", callback_data="mood_1"),
          InlineKeyboardButton("2 😕", callback_data="mood_2"),
@@ -344,6 +375,7 @@ async def mood_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
          InlineKeyboardButton("5 😊", callback_data="mood_5")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
+
     await update.message.reply_text(
         "Как ты себя чувствуешь прямо сейчас? От 1 до 5 💛",
         reply_markup=reply_markup
@@ -351,35 +383,30 @@ async def mood_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ==================== ОБРАБОТЧИКИ КНОПОК ====================
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка нажатий на кнопки"""
     query = update.callback_query
     await query.answer()
+
     user_id = update.effective_user.id
     data = query.data
     log_event(user_id, f"button_{data}")
 
-    # --- ГЕНЕРИРУЕМЫЕ ЧЕРЕЗ LLM КНОПКИ ---
     if data == "morning":
-        user_prompt = "Попроси утренний ритуал — тёплое начало дня с вопросом о том, что хорошего уже случилось."
-        extra = "Сейчас утро. Ответ должен быть коротким (1-3 предложения), тёплым и заканчиваться вопросом."
-        ai_response = await generate_button_response(user_id, user_prompt, extra)
-        await query.edit_message_text(ai_response)
+        morning_text = """Доброе утро 🌙
+
+Сегодня не нужно быть идеальной. Достаточно быть собой.
+
+Что одно хорошее ты уже сделала сегодня? (Да, встать с кровати — тоже считается)"""
+        await query.edit_message_text(morning_text)
 
     elif data == "evening":
-        user_prompt = "Попроси вечерний ритуал — мягкое подведение итогов дня с вопросом о благодарности."
-        extra = "Сейчас вечер. Ответ должен быть уютным, коротким и заканчиваться вопросом о том, за что пользователь благодарит себя."
-        ai_response = await generate_button_response(user_id, user_prompt, extra)
-        await query.edit_message_text(ai_response)
+        evening_text = """Вечер 🌙
 
-    elif data.startswith("mood_"):
-        mood = int(data.split("_")[1])
-        save_mood(user_id, mood)
+Сегодня ты делала достаточно. Даже если кажется, что нет.
 
-        user_prompt = f"Я оценила настроение на {mood} из 5. Что бы ты сказал(а) мне сейчас?"
-        extra = f"Пользователь оценил настроение на {mood} из 5. Ответ должен быть поддерживающим, без советов, отражать чувства."
-        ai_response = await generate_button_response(user_id, user_prompt, extra)
-        await query.edit_message_text(ai_response)
+Одна вещь, за которую ты себя сегодня благодаришь?"""
+        await query.edit_message_text(evening_text)
 
-    # --- СТАТИЧЕСКИЕ КНОПКИ (меню, донат) ---
     elif data == "donate":
         donate_text = """Я бесплатный. Но если хочешь, чтобы я остался рядом — и для тебя, и для других — можно кинуть на кофе ☕
 
@@ -389,6 +416,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 🏦 СБП: +7(926)222-70-02
 
 💛 Спасибо, что ты здесь"""
+
+        # Кнопка для быстрого перехода
         keyboard = [
             [InlineKeyboardButton("💳 Перевести на ЮMoney", url="https://yoomoney.ru/to/4100119579631856")],
             [InlineKeyboardButton("🔙 Назад", callback_data="back_to_menu")],
@@ -397,7 +426,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(donate_text, reply_markup=reply_markup)
 
     elif data == "back_to_menu":
-        welcome_text = "Я рядом 💛\n\nЧем могу помочь?"
+        welcome_text = """Я рядом 💛
+
+Чем могу помочь?"""
         keyboard = [
             [InlineKeyboardButton("🌅 Утренний ритуал", callback_data="morning")],
             [InlineKeyboardButton("🌙 Вечерний ритуал", callback_data="evening")],
@@ -419,32 +450,56 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text("Как ты себя чувствуешь прямо сейчас? От 1 до 5 💛", reply_markup=reply_markup)
 
+    elif data.startswith("mood_"):
+        mood = int(data.split("_")[1])
+        save_mood(user_id, mood)
+
+        responses = {
+            1: "Слышу тебя. Сегодня тяжело, и это нормально. Я рядом 🌙",
+            2: "Такие дни бывают. Не нужно быть сильной прямо сейчас 💛",
+            3: "Нейтрально — тоже ок. Не каждый день должен быть ярким ✨",
+            4: "Хорошее настроение — это уже победа. Заметила? 🌟",
+            5: "Отлично! Что сегодня подарило это чувство? Хочу знать 💛"
+        }
+        await query.edit_message_text(responses[mood])
+
 # ==================== ОБРАБОТКА ТЕКСТОВЫХ СООБЩЕНИЙ ====================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка обычных сообщений"""
     user = update.effective_user
     user_id = user.id
     user_message = update.message.text
 
+    # Сохраняем пользователя, если новый
     add_user(user_id, user.username, user.first_name)
 
-    # Автоопределение имени (оставлено как было)
+    # Если пользователь называет своё имя в первых сообщениях
     user_data = get_user(user_id)
     if user_data and not user_data[6] and len(user_message) < 20 and not user_message.startswith("/"):
+        # Проверяем, похоже ли на имя
         if user_message.strip().istitle() or len(user_message.strip().split()) == 1:
             update_user_name(user_id, user_message.strip())
 
+    # Сохраняем сообщение пользователя
     save_message(user_id, "user", user_message)
     increment_message_count(user_id)
     log_event(user_id, "message", f"length:{len(user_message)}")
 
+    # Показываем "печатает..."
     await update.message.chat.send_action(action="typing")
 
+    # Получаем ответ от ИИ
     ai_response = get_ai_response(user_id, user_message)
+
+    # Сохраняем ответ бота
     save_message(user_id, "assistant", ai_response)
+
+    # Отправляем ответ
     await update.message.reply_text(ai_response)
 
 # ==================== ОШИБКИ ====================
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка ошибок"""
     logger.error(f"Update {update} caused error {context.error}")
     if update and update.effective_message:
         await update.effective_message.reply_text(
@@ -453,19 +508,27 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ==================== ГЛАВНАЯ ФУНКЦИЯ ====================
 def main():
+    # Инициализируем базу данных
     init_db()
+
+    # Создаём приложение
     application = Application.builder().token(TELEGRAM_TOKEN).build()
 
+    # Добавляем обработчики
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("stats", stats_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("mood", mood_command))
     application.add_handler(CallbackQueryHandler(button_handler))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    # Обработка ошибок
     application.add_error_handler(error_handler)
 
+    # Запускаем бота
     print("🌙 Бот 'Я с тобой, я рядом' запущен!")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
-    main()  # теперь просто main()
+    import asyncio
+    asyncio.run(main())
